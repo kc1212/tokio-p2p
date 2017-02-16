@@ -1,0 +1,13 @@
+[package]
+name = "bracha-bcast"
+version = "0.1.0"
+authors = ["kc1212 <kc1212@users.noreply.github.com>"]
+
+[dependencies]
+bincode = "0.6"
+serde = "0.8"
+serde_derive = "0.8"
+futures = "0.1"
+tokio-core = "0.1"
+tokio-proto = "0.1"
+tokio-timer = "0.1"
