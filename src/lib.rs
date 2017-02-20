@@ -4,24 +4,43 @@
 extern crate futures;
 extern crate tokio_core;
 extern crate tokio_proto;
+extern crate byteorder;
 extern crate bincode;
 #[macro_use]
 extern crate serde_derive;
+#[macro_use]
+extern crate log;
 
-use tokio_core::net::{UdpFramed, UdpCodec};
-use futures::{stream, Sink, Stream, Future};
+use tokio_core::reactor::Handle;
+use tokio_core::io::{Io, EasyBuf, Codec};
+use tokio_core::net::TcpListener;
+use futures::{Sink, Stream, Future};
 use futures::sync::mpsc;
-
 use bincode::{SizeLimit, serde};
-use std::io;
+use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
+
+use std::io::{self, Cursor};
 use std::rc::Rc;
 use std::cell::RefCell;
+use std::collections::HashMap;
+use std::net::SocketAddr;
+use std::mem;
 
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 pub struct Msg {
     round: u32,
     ty: MsgType,
     body: String,
+}
+
+impl Msg {
+    pub fn new(body: String) -> Msg {
+        Msg {
+            round: 9, // TODO randomise
+            ty: MsgType::Init,
+            body: body,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
@@ -31,37 +50,150 @@ pub enum MsgType {
     Ready,
 }
 
-pub struct MsgCodec;
+pub struct MsgCodec {
+    state: CodecState,
+}
 
-use std::net::SocketAddr;
-impl UdpCodec for MsgCodec {
-    type In = (SocketAddr, Msg);
-    type Out = (SocketAddr, Msg);
-
-    fn decode(&mut self, src: &SocketAddr, buf: &[u8]) -> io::Result<Self::In> {
-        let res = serde::deserialize(buf).map(|res| (*src, res))
-            .map_err(|deserialize_err| io::Error::new(io::ErrorKind::Other, deserialize_err));
-        res
-    }
-
-    fn encode(&mut self, (src, msg): Self::Out, buf: &mut Vec<u8>) -> SocketAddr {
-        match serde::serialize_into(buf, &msg, SizeLimit::Infinite) {
-            Ok(_) => (),
-            Err(e) => println!("{:?}", e),
-        };
-        src
+impl MsgCodec {
+    fn new() -> Self {
+        MsgCodec {
+            state: CodecState::Len,
+        }
     }
 }
 
-pub struct Server {
-    n: u32,
-    t: u32,
+enum CodecState {
+    Len,
+    Payload { len: usize }, // u64 in the wire
+}
+
+impl Codec for MsgCodec {
+    type In = Msg;
+    type Out = Msg;
+
+    fn decode(&mut self, buf: &mut EasyBuf) -> io::Result<Option<Self::In>> {
+        use self::CodecState::*;
+        loop {
+            match self.state {
+                Len if buf.len() < mem::size_of::<u64>() => {
+                    debug!("Len: buf len is {}, waiting", buf.len());
+                    return Ok(None);
+                }
+                Len => {
+                    let mut len_buf = buf.drain_to(mem::size_of::<u64>());
+                    let len = Cursor::new(&mut len_buf).read_u64::<BigEndian>()?;
+                    debug!("Len: parsed len = {}", len);
+                    self.state = Payload { len: len as usize };
+                }
+                Payload { len } if buf.len() < len => {
+                    debug!("Payload: buf len is {}, waiting", buf.len());
+                    return Ok(None);
+                }
+                Payload { len } => {
+                    let payload = buf.drain_to(len);
+                    let res = serde::deserialize_from(&mut Cursor::new(payload), SizeLimit::Infinite)
+                        .map_err(|deserialize_err| io::Error::new(io::ErrorKind::Other, deserialize_err))?;
+
+                    self.state = Len;
+
+                    debug!("Payload: parsed payload: {:?}", res);
+                    return Ok(Some(res));
+                }
+            }
+        }
+    }
+
+    fn encode(&mut self, msg: Self::Out, buf: &mut Vec<u8>) -> io::Result<()> {
+        //buf.write_u64::<BigEndian>(id)?;
+        buf.write_u64::<BigEndian>(serde::serialized_size(&msg))?;
+        serde::serialize_into(buf, &msg, SizeLimit::Infinite)
+            .map_err(|serialize_err| io::Error::new(io::ErrorKind::Other, serialize_err))?;
+        debug!("encoded msg {:?} into {:?}", msg, buf);
+        Ok(())
+    }
+}
+
+type Nodes = HashMap<SocketAddr, Option<mpsc::UnboundedSender<Msg>>>;
+
+// global setting, read only, perhaps use Arc?
+pub struct Config {
+    pub n: u32,
+    pub t: u32,
+    pub me: SocketAddr,
+    pub nodes: Nodes,
+}
+
+impl Config {
+    pub fn new(me: SocketAddr, addrs: Vec<SocketAddr>, t: u32) -> Rc<RefCell<Config>> {
+        let mut nodes = HashMap::new();
+        nodes.insert(me, None);
+        for addr in addrs {
+            nodes.insert(addr, None);
+        }
+
+        Rc::new(RefCell::new(
+            Config {
+                n: nodes.len() as u32,
+                t: t,
+                me: me,
+                nodes: nodes,
+            }
+        ))
+    }
+}
+
+// make connections to all clients
+pub fn run_clients(config: Rc<RefCell<Config>>, handle: Handle) -> Box<Future<Item=(), Error=io::Error>> {
+    unimplemented!()
+}
+
+// 
+pub fn serve(config: Rc<RefCell<Config>>, handle: Handle) -> Box<Future<Item=(), Error=io::Error>> {
+    let bracha = Rc::new(RefCell::new(BrachaNode::new(config.clone())));
+
+    let socket = TcpListener::bind(&config.borrow().me, &handle).unwrap();
+    println!("listening on {}", config.borrow().me);
+
+    let srv = socket.incoming().for_each(move |(tcpstream, addr)| {
+        let bracha = bracha.clone();
+        let framed = tcpstream.framed(MsgCodec::new());
+        let (sink, stream) = framed.split();
+
+        let (tx, rx) = mpsc::unbounded();
+        if config.borrow().nodes.contains_key(&addr) {
+            config.borrow_mut().nodes.insert(addr, Some(tx));
+        } else {
+            return Ok(())
+        }
+
+        // process the incoming stream
+        let read = stream.for_each(move |msg| {
+            // application logic
+            // TODO, not here
+            // bracha.borrow_mut().process(msg);
+            Ok(())
+        });
+        handle.spawn(read.then(|_| Ok(())));
+
+        // send everything in rx to sink
+        let write = sink.send_all(rx.map_err(|()| {
+            io::Error::new(io::ErrorKind::Other, "rx shouldn't have an error")
+        }));
+        handle.spawn(write.then(|_| Ok(())));
+
+        Ok(())
+    });
+
+    Box::new(srv)
+}
+
+pub struct BrachaNode {
+    config: Rc<RefCell<Config>>,
     round: u32,
     step: ServerStep,
     init_count: u32,
     echo_count: u32,
     ready_count: u32,
-    nodes: Rc<RefCell<Vec<SocketAddr>>>, // include myself
 }
 
 #[derive(Debug)]
@@ -72,102 +204,80 @@ enum ServerStep {
     Three,
 }
 
-impl Server {
-    pub fn new(nodes: Vec<SocketAddr>) -> Self {
-        let n = nodes.len() as u32;
-        Server {
-            n: n,
-            t: (n - 1) / 3,
+impl BrachaNode {
+    pub fn new(config: Rc<RefCell<Config>>) -> BrachaNode {
+        BrachaNode {
+            config: config,
             round: 0,
             step: ServerStep::One,
             init_count: 0,
             echo_count: 0,
             ready_count: 0,
-            nodes: Rc::new(RefCell::new(nodes)),
         }
     }
 
-    pub fn serve(mut self, framed: UdpFramed<MsgCodec>, rx: mpsc::Receiver<String>)
-            -> Box<Future<Item=(), Error=io::Error>> {
-
+    // do one round of processing on a new message
+    pub fn process(&mut self, msg: Msg) {
         use MsgType::*;
         use ServerStep::*;
-        let (sink, stream) = framed.split();
+        let config = self.config.borrow();
 
-        let nodes1 = self.nodes.clone();
-        let nodes2 = self.nodes.clone();
+        // access control
+        if !config.nodes.contains_key(&config.me) {
+            return;
+        }
+        // check round number
+        if msg.ty != Init && msg.round != self.round {
+            return;
+        }
+        // update the states
+        match msg.ty {
+            Init => { self.round = msg.round; self.init_count += 1; }
+            Echo => self.echo_count += 1,
+            Ready => self.ready_count += 1,
+        };
+        // do action on new state
+        println!("received type {:?} in {:?}", msg.ty, self.step);
+        match self.step {
+            One => {
+                if self.ok_to_echo() {
+                    self.step = Two;
+                    println!("into Two");
+                    self.broadcast(Msg{ round: self.round, ty: Echo, body: msg.body });
+                    return;
+                }
+            },
+            Two => {
+                if self.ok_to_ready() {
+                    self.step = Three;
+                    println!("into Three");
+                    self.broadcast(Msg{ round: self.round, ty: Ready, body: msg.body });
+                    return;
+                }
+            },
+            Three => {
+                self.step = One;
+                self.round = 0;
+                println!("Decided {:?}", msg.body);
+                return;
+            },
+        };
+    }
 
-        println!("starting, n = {}, t = {}", self.n, self.t);
-
-        let udp_stream = stream.filter_map(move |(src, msg)| {
-            let nodes = nodes1.borrow();
-            // TODO check msg.body to match
-            // check validity
-            if !nodes.contains(&src) {
-                return None;
-            }
-            // check round number
-            if msg.ty != Init && msg.round != self.round {
-                return None;
-            }
-            // update the states
-            match msg.ty {
-                Init => { self.round = msg.round; self.init_count += 1; }
-                Echo => self.echo_count += 1,
-                Ready => self.ready_count += 1,
-            };
-            // do action on new state
-            println!("received type {:?} in {:?}", msg.ty, self.step);
-            match self.step {
-                One => {
-                    if self.ok_to_echo() {
-                        self.step = Two;
-                        println!("into Two");
-                        return Some(stream::iter(make_msgs(&nodes,
-                            Msg{ round: self.round, ty: Echo, body: msg.body })));
-                    }
-                },
-                Two => {
-                    if self.ok_to_ready() {
-                        self.step = Three;
-                        println!("into Three");
-                        return Some(stream::iter(make_msgs(&nodes,
-                            Msg{ round: self.round, ty: Ready, body: msg.body })));
-                    }
-                },
-                Three => {
-                    self.step = One;
-                    self.round = 0;
-                    println!("Decided {:?}", msg.body);
-                },
-            };
-            None
-        }).flatten();
-
-        let rx_stream = rx.then(move |res| {
-            let nodes = nodes2.borrow();
-            match res {
-                // TODO randomise round
-                Ok(body) => Ok(stream::iter((make_msgs(&nodes, Msg{round: 9, ty: Init, body: body})))),
-                Err(()) => Err(io::Error::from_raw_os_error(-1)),
-            }
-        }).flatten();
-
-        let f = sink.send_all(
-            udp_stream.select(rx_stream)
-        );
-        Box::new(f.then(|_| Ok(())))
+    fn broadcast(&self, msg: Msg) {
+        broadcast(&self.config.borrow().nodes, msg);
     }
 
     fn ok_to_echo(&self) -> bool {
         if self.init_count > 0 || self.ok_to_ready() {
             return true;
-        }     
+        }
         return false;
     }
 
     fn ok_to_ready(&self) -> bool {
-        if (self.n + self.t) / 2 >= self.echo_count || (self.t + 1) >= self.ready_count {
+        let config = self.config.borrow();
+        if (config.n + config.t) / 2 >= self.echo_count || (config.t + 1) >= self.ready_count {
             return true;
         }     
         return false;
@@ -176,99 +286,14 @@ impl Server {
 
 pub fn strings_to_addrs(ss: Vec<String>) -> Vec<SocketAddr> {
     ss.iter().map(|s| {
-        s.parse().unwrap()
+        s.parse().expect("parsing failed in string_to_addrs")
     }).collect()
 }
 
-fn make_msgs(addrs: &Vec<SocketAddr>, msg: Msg) -> Vec<Result<(SocketAddr, Msg), io::Error>> {
-    let mut v = vec![];
-    for addr in addrs {
-        v.push(Ok((*addr, msg.clone())));
-    };
-    v
-}
-
-
-/*
-#[derive(Debug, PartialEq, Deserialize, Serialize)]
-pub struct Msg {
-    ty: u32,
-    body: String,
-}
-
-pub struct MsgCodec {
-    state: CodecState,
-}
-
-enum CodecState {
-    Id,
-    Len { id: RequestId }, // alias for u64
-    Payload { id: RequestId, len: u64 },
-}
-
-impl MsgCodec {
-    fn new() -> Self {
-        MsgCodec {
-            state: CodecState::Id,
+pub fn broadcast(nodes: &Nodes, msg: Msg) {
+    for sock in nodes.values() {
+        if let &Some(ref tx) = sock {
+            tx.send(msg.clone()).expect("tx send failed");
         }
     }
 }
-
-impl Codec for MsgCodec {
-    type In = (RequestId, Msg);
-    type Out = (RequestId, Msg);
-
-    fn decode(&mut self, buf: &mut EasyBuf) -> io::Result<Option<Self::In>> {
-        use self::CodecState::*;
-        let len_u64 = mem::size_of::<u64>();
-        loop {
-            match self.state {
-                Id if buf.len() < len_u64 => {
-                    info!("buf len is {}, waiting for {} at id", buf.len(), len_u64);
-                    return Ok(None);
-                }
-                Id => {
-                    let mut id_buf = buf.drain_to(len_u64);
-                    let id = Cursor::new(&mut id_buf).read_u64::<BigEndian>()?;
-                    info!("parsed id = {} from {:?}", id, id_buf.as_slice());
-                    self.state = Len { id: id };
-                }
-                Len { .. } if buf.len() < len_u64 => {
-                    info!("buf len is {}, waiting for {} at len", buf.len(), len_u64);
-                    return Ok(None);
-                }
-                Len { id } => {
-                    let mut len_buf = buf.drain_to(len_u64);
-                    let len = Cursor::new(&mut len_buf).read_u64::<BigEndian>()?;
-                    info!("parsed len = {} from {:?}", len, len_buf.as_slice());
-                    self.state = Payload { id: id, len: len };
-                }
-                Payload { len, .. } if buf.len() < len as usize => {
-                    info!("buf len is {}, waiting for {}", buf.len(), len);
-                    return Ok(None);
-                }
-                Payload { id, len } => {
-                    let payload = buf.drain_to(len as usize);
-                    let res = bc::deserialize_from(&mut Cursor::new(payload), SizeLimit::Infinite)
-                        .map_err(|deserialize_err| io::Error::new(io::ErrorKind::Other, deserialize_err))?;
-
-                    self.state = Id;
-
-                    info!("decoded payload: {}", len);
-                    return Ok(Some((id, res)))
-                }
-            }
-        }
-    }
-
-    fn encode(&mut self, (id, msg): Self::Out, buf: &mut Vec<u8>) -> io::Result<()> {
-        buf.write_u64::<BigEndian>(id)?;
-        buf.write_u64::<BigEndian>(bc::serialized_size(&msg))?;
-        bc::serialize_into(buf, &msg, SizeLimit::Infinite)
-            .map_err(|serialize_err| io::Error::new(io::ErrorKind::Other, serialize_err))?;
-        info!("encoded msg {:?} into {:?}", msg, buf);
-        Ok(())
-    }
-}
-
-*/
