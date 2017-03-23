@@ -26,24 +26,23 @@ fn do_work(me: SocketAddr, msg: Option<String>) {
     let handle = core.handle();
 
     let node = Node::new(me);
-    let node2 = node.clone();
-    let node3 = node.clone();
-    let s = serve(node, handle.clone());
+    let s = serve(node.clone(), handle.clone());
 
     for p in peers {
-        handle.spawn(start_client(node2.clone(), handle.clone(), &p.parse().unwrap())
-                     .then(|e| {
-                         println!("Failed to connect {:?}", e);
+        handle.spawn(start_client(node.clone(), handle.clone(), &p.parse().unwrap())
+                     .then(move |x| {
+                         println!("client {} done {:?}", p, x);
                          Ok(())
                      }));
     }
 
+    let timer = Timer::default();
+    let node2 = node.clone();
     match msg {
         Some(msg) => {
-            let timer = Timer::default();
-            let f = timer.sleep(Duration::from_millis(5000))
+            let f = timer.sleep(Duration::from_secs(1))
                 .and_then(move |_| {
-                    node3.borrow().broadcast(msg);
+                    node2.borrow().broadcast(msg);
                     Ok(())
                 });
             handle.spawn(f.then(|_| Ok(())));
@@ -51,11 +50,17 @@ fn do_work(me: SocketAddr, msg: Option<String>) {
         None => (),
     }
 
+    /*
+    handle.spawn(gossip_periodic(node.clone(), timer.interval(Duration::from_secs(1)), Msg::).then(|e| {
+        println!("Run periodic failed {:?}", e);
+        Ok(())
+    }));
+    */
+
     core.run(s).unwrap();
 }
 
 fn main() {
-    // the first argument is the host address
     let args: Vec<String> = env::args().collect();
     let program = args[0].clone();
 

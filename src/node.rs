@@ -2,14 +2,16 @@ use std::io;
 use std::rc::Rc;
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use uuid::Uuid;
+use rand::{thread_rng, Rng, ThreadRng};
 
 use futures::{Future, Stream, Sink};
 use futures::sync::mpsc;
 use tokio_core::io::Io;
 use tokio_core::reactor::Handle;
 use tokio_core::net::{TcpStream, TcpListener};
+use tokio_timer::Interval;
 
 use codec::{Msg, MsgCodec};
 
@@ -19,6 +21,7 @@ pub struct Node {
     pub id: Uuid,
     pub addr: SocketAddr,
     pub peers: HashMap<Uuid, Tx>,
+    rng: Rc<RefCell<ThreadRng>>,
 }
 
 impl Node {
@@ -27,6 +30,7 @@ impl Node {
             id: Uuid::new_v4(),
             addr: addr,
             peers: HashMap::new(),
+            rng: Rc::new(RefCell::new(thread_rng())),
         };
         println!("I'm {:?}", node.id);
         Rc::new(RefCell::new(node))
@@ -37,6 +41,19 @@ impl Node {
         for tx in self.peers.values() {
             // TODO do something better than expect?
             tx.send(Msg::Payload(m.clone())).expect("tx send failed");
+        }
+    }
+
+    pub fn send_random(&self, m: Msg) {
+        println!("sending {:?} to random node", m);
+        let high = self.peers.len();
+        loop {
+            for tx in self.peers.values() {
+                if self.rng.borrow_mut().gen_range(0, high) == 0 {
+                    tx.send(m).expect("tx send failed");
+                    return;
+                }
+            }
         }
     }
 
@@ -83,13 +100,19 @@ impl Node {
         println!("received payload: {}", m);
         Ok(())
     }
+
+    fn rand_port(&self) -> SocketAddr {
+        // TODO this does not check whether the port is already taken
+        let port: u16 = self.rng.borrow_mut().gen_range(49152, 65535);
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), port)
+    }
 }
 
 pub fn start_client(node: Rc<RefCell<Node>>, handle: Handle, addr: &SocketAddr)
                     -> Box<Future<Item=(), Error=io::Error>> {
-    println!("starting client on {}", node.borrow().addr);
-    let f = TcpStream::connect(&addr, &handle).and_then(move |socket| {
-        println!("connected to server {}", node.borrow().addr);
+    println!("starting client {}", addr);
+    let client = TcpStream::connect(&addr, &handle).and_then(move |socket| {
+        println!("connected... local: {:?}, peer {:?}", socket.local_addr(), socket.peer_addr());
         let (sink, stream) = socket.framed(MsgCodec).split();
         let (tx, rx) = mpsc::unbounded();
         let node2 = node.clone();
@@ -100,7 +123,7 @@ pub fn start_client(node: Rc<RefCell<Node>>, handle: Handle, addr: &SocketAddr)
         });
         handle.spawn(read.then(|_| Ok(())));
 
-        // send ping
+        // client sends ping on start
         mpsc::UnboundedSender::send(&tx2, Msg::Ping((node2.borrow().id, node2.borrow().addr.clone())))
             .expect("tx failed");
 
@@ -113,10 +136,11 @@ pub fn start_client(node: Rc<RefCell<Node>>, handle: Handle, addr: &SocketAddr)
         Ok(())
     });
 
-    return Box::new(f);
+    return Box::new(client);
 }
 
-pub fn serve(node: Rc<RefCell<Node>>, handle: Handle) -> Box<Future<Item=(), Error=io::Error>> {
+pub fn serve(node: Rc<RefCell<Node>>, handle: Handle)
+             -> Box<Future<Item=(), Error=io::Error>> {
     let socket = TcpListener::bind(&node.borrow().addr, &handle).unwrap();
     println!("listening on {}", node.borrow().addr);
 
@@ -124,7 +148,7 @@ pub fn serve(node: Rc<RefCell<Node>>, handle: Handle) -> Box<Future<Item=(), Err
         let (sink, stream) = tcpstream.framed(MsgCodec).split();
         let (tx, rx) = mpsc::unbounded();
 
-        // process the incoming stream, there shouldn't be any...
+        // process the incoming stream
         let node2 = node.clone();
         let read = stream.for_each(move |msg| {
             node2.borrow_mut().process(msg, tx.clone())
@@ -141,5 +165,23 @@ pub fn serve(node: Rc<RefCell<Node>>, handle: Handle) -> Box<Future<Item=(), Err
     });
 
     Box::new(srv)
+}
+
+/*
+pub fn gossip_node_list(node: Rc<RefCell<Node>>, interval: Interval) {
+    gossip_periodic(node, interval, )
+}
+*/
+
+pub fn gossip_periodic(node: Rc<RefCell<Node>>, interval: Interval, m: Msg)
+                  -> Box<Future<Item=(), Error=io::Error>> {
+    let node = node.clone();
+    let f = interval.for_each(move |_| {
+        Ok(node.borrow().send_random(m.clone()))
+    });
+
+    Box::new(f.map_err(|e| {
+        io::Error::new(io::ErrorKind::Other, e)
+    }))
 }
 
