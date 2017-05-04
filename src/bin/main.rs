@@ -20,29 +20,20 @@ fn print_usage(program: &str, opts: getopts::Options) {
 }
 
 fn do_work(me: SocketAddr, msg: Option<String>) {
-    let peers = vec!["127.0.0.1:12345", "127.0.0.1:12346", "127.0.0.1:12347"];
+    let peers = vec!["127.0.0.1:12345", "127.0.0.1:12346", "127.0.0.1:12347"]
+        .into_iter().map(|p| p.parse().unwrap());
 
     let mut core = Core::new().unwrap();
     let handle = core.handle();
-
     let node = Node::new(me);
-    let s = serve(node.clone(), handle.clone());
-
-    for p in peers {
-        handle.spawn(start_client(node.clone(), handle.clone(), &p.parse().unwrap())
-                     .then(move |x| {
-                         println!("client {} done {:?}", p, x);
-                         Ok(())
-                     }));
-    }
+    let f = node.run(handle.clone(), peers);
 
     let timer = Timer::default();
-    let node2 = node.clone();
     match msg {
         Some(msg) => {
             let f = timer.sleep(Duration::from_secs(1))
                 .and_then(move |_| {
-                    node2.borrow().broadcast(msg);
+                    node.broadcast(msg);
                     Ok(())
                 });
             handle.spawn(f.then(|_| Ok(())));
@@ -50,14 +41,7 @@ fn do_work(me: SocketAddr, msg: Option<String>) {
         None => (),
     }
 
-    /*
-    handle.spawn(gossip_periodic(node.clone(), timer.interval(Duration::from_secs(1)), Msg::).then(|e| {
-        println!("Run periodic failed {:?}", e);
-        Ok(())
-    }));
-    */
-
-    core.run(s).unwrap();
+    core.run(f).unwrap();
 }
 
 fn main() {
