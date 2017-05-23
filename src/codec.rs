@@ -11,7 +11,7 @@ pub enum Msg {
     Ping((Uuid, SocketAddr)),
     Pong((Uuid, SocketAddr)),
     Payload(String),
-    // AddrVec(Vec<(Uuid, SocketAddr)>),
+    AddrVec(Vec<(Uuid, SocketAddr)>),
 }
 
 pub struct MsgCodec; // json line

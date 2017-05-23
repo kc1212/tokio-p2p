@@ -38,21 +38,21 @@ impl Node {
                -> Box<Future<Item=(), Error=io::Error>> {
         let inner = self.inner.clone();
         let f = Node::serve(inner.clone(), handle.clone());
-        Node::start_clients(inner.clone(), handle.clone(), peers);
+        for peer in peers {
+            let inner = inner.clone();
+            Node::start_client(inner, handle.clone(), peer);
+        }
         f
     }
 
-    fn start_clients<I: Iterator<Item=SocketAddr>>(inner: Rc<RefCell<NodeInner>>, handle: Handle, peers: I) {
-        for peer in peers {
-            let inner = inner.clone();
-            handle.spawn(Node::start_client(inner, handle.clone(), &peer).then(move |x| {
-                println!("client {} done {:?}", peer, x);
-                Ok(())
-            }));
-        }
+    fn start_client(inner: Rc<RefCell<NodeInner>>, handle: Handle, addr: SocketAddr) {
+        handle.spawn(Node::start_client_actual(inner, handle.clone(), &addr).then(move |x| {
+            println!("client {} done {:?}", addr, x);
+            Ok(())
+        }));
     }
 
-    fn start_client(inner: Rc<RefCell<NodeInner>>, handle: Handle, addr: &SocketAddr)
+    fn start_client_actual(inner: Rc<RefCell<NodeInner>>, handle: Handle, addr: &SocketAddr)
                         -> Box<Future<Item=(), Error=io::Error>> {
         println!("starting client {}", addr);
         let client = TcpStream::connect(&addr, &handle).and_then(move |socket| {
@@ -62,9 +62,10 @@ impl Node {
 
             let inner1 = inner.clone();
             let tx1 = tx.clone();
+            let handle1 = handle.clone();
             let read = stream.for_each(move |msg| {
                 // inner.borrow_mut().process(msg, tx.clone())
-                Node::process(inner1.clone(), msg, tx1.clone())
+                Node::process(inner1.clone(), msg, tx1.clone(), handle1.clone())
             });
             handle.spawn(read.then(|_| Ok(())));
 
@@ -98,8 +99,9 @@ impl Node {
             // process the incoming stream
             let inner1= inner.clone();
             let tx1 = tx.clone();
+            let handle1 = handle.clone();
             let read = stream.for_each(move |msg| {
-                Node::process(inner1.clone(), msg, tx1.clone())
+                Node::process(inner1.clone(), msg, tx1.clone(), handle1.clone())
                 // inner2.borrow_mut().process(msg, tx.clone())
             });
             handle.spawn(read.then(|_| Ok(())));
@@ -116,18 +118,19 @@ impl Node {
         Box::new(srv)
     }
 
-    fn process(inner: Rc<RefCell<NodeInner>>, msg: Msg, tx: Tx) -> Result<(), io::Error> {
+    fn process(inner: Rc<RefCell<NodeInner>>, msg: Msg, tx: Tx, handle: Handle) -> Result<(), io::Error> {
         match msg {
             Msg::Ping(m) => inner.borrow_mut().handle_ping(m, tx),
             Msg::Pong(m) => inner.borrow_mut().handle_pong(m, tx),
             Msg::Payload(m) => inner.borrow_mut().handle_payload(m, tx),
-            // Msg::AddrVec(m) => {
-            //     for addr in m {
-            //         if !inner.borrow().peers.contains_key(addr) {
-            //             Node::start_client(inner, handle, addr)
-            //         }
-            //     }
-            // },
+            Msg::AddrVec(m) => {
+                for (id, addr) in m {
+                    if !inner.borrow().peers.contains_key(&id) {
+                        Node::start_client(inner.clone(), handle.clone(), addr);
+                    }
+                }
+                Ok(())
+            },
         }
     }
 
@@ -139,6 +142,7 @@ impl Node {
         self.inner.borrow().send_random(m)
     }
 
+    // TODO use this function to gossip peers
     pub fn gossip_periodic(&self, interval: Interval, m: Msg)
                            -> Box<Future<Item=(), Error=io::Error>> {
         let node = self.inner.clone();
