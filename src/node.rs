@@ -36,34 +36,42 @@ impl Node {
 
     pub fn run<I: Iterator<Item=SocketAddr>>(&self, handle: Handle, peers: I)
                -> Box<Future<Item=(), Error=io::Error>> {
-        let f = self.serve(handle.clone());
+        let inner = self.inner.clone();
+        let f = Node::serve(inner.clone(), handle.clone());
+        Node::start_clients(inner.clone(), handle.clone(), peers);
+        f
+    }
+
+    fn start_clients<I: Iterator<Item=SocketAddr>>(inner: Rc<RefCell<NodeInner>>, handle: Handle, peers: I) {
         for peer in peers {
-            handle.spawn(self.start_client(handle.clone(), &peer).then(move |x| {
+            let inner = inner.clone();
+            handle.spawn(Node::start_client(inner, handle.clone(), &peer).then(move |x| {
                 println!("client {} done {:?}", peer, x);
                 Ok(())
             }));
         }
-        f
     }
 
-    fn start_client(&self, handle: Handle, addr: &SocketAddr)
+    fn start_client(inner: Rc<RefCell<NodeInner>>, handle: Handle, addr: &SocketAddr)
                         -> Box<Future<Item=(), Error=io::Error>> {
         println!("starting client {}", addr);
-        let node = self.inner.clone();
         let client = TcpStream::connect(&addr, &handle).and_then(move |socket| {
             println!("connected... local: {:?}, peer {:?}", socket.local_addr(), socket.peer_addr());
             let (sink, stream) = socket.framed(MsgCodec).split();
             let (tx, rx) = mpsc::unbounded();
-            let node2 = node.clone();
-            let tx2 = tx.clone();
 
+            let inner1 = inner.clone();
+            let tx1 = tx.clone();
             let read = stream.for_each(move |msg| {
-                node.borrow_mut().process(msg, tx.clone())
+                // inner.borrow_mut().process(msg, tx.clone())
+                Node::process(inner1.clone(), msg, tx1.clone())
             });
             handle.spawn(read.then(|_| Ok(())));
 
             // client sends ping on start
-            mpsc::UnboundedSender::send(&tx2, Msg::Ping((node2.borrow().id, node2.borrow().addr.clone())))
+            let inner2 = inner.clone();
+            let tx2 = tx.clone();
+            mpsc::UnboundedSender::send(&tx2, Msg::Ping((inner2.borrow().id, inner2.borrow().addr.clone())))
                 .expect("tx failed");
 
             // send everything in rx to sink
@@ -78,20 +86,21 @@ impl Node {
         return Box::new(client);
     }
 
-    fn serve(&self, handle: Handle)
+    fn serve(inner: Rc<RefCell<NodeInner>>, handle: Handle)
                  -> Box<Future<Item=(), Error=io::Error>> {
-        let node = self.inner.clone();
-        let socket = TcpListener::bind(&node.borrow().addr, &handle).unwrap();
-        println!("listening on {}", node.borrow().addr);
+        let socket = TcpListener::bind(&inner.borrow().addr, &handle).unwrap();
+        println!("listening on {}", inner.borrow().addr);
 
         let srv = socket.incoming().for_each(move |(tcpstream, addr)| {
             let (sink, stream) = tcpstream.framed(MsgCodec).split();
             let (tx, rx) = mpsc::unbounded();
 
             // process the incoming stream
-            let node2 = node.clone();
+            let inner1= inner.clone();
+            let tx1 = tx.clone();
             let read = stream.for_each(move |msg| {
-                node2.borrow_mut().process(msg, tx.clone())
+                Node::process(inner1.clone(), msg, tx1.clone())
+                // inner2.borrow_mut().process(msg, tx.clone())
             });
             handle.spawn(read.then(|_| Ok(())));
 
@@ -107,6 +116,20 @@ impl Node {
         Box::new(srv)
     }
 
+    fn process(inner: Rc<RefCell<NodeInner>>, msg: Msg, tx: Tx) -> Result<(), io::Error> {
+        match msg {
+            Msg::Ping(m) => inner.borrow_mut().handle_ping(m, tx),
+            Msg::Pong(m) => inner.borrow_mut().handle_pong(m, tx),
+            Msg::Payload(m) => inner.borrow_mut().handle_payload(m, tx),
+            // Msg::AddrVec(m) => {
+            //     for addr in m {
+            //         if !inner.borrow().peers.contains_key(addr) {
+            //             Node::start_client(inner, handle, addr)
+            //         }
+            //     }
+            // },
+        }
+    }
 
     pub fn broadcast(&self, m: String) {
         self.inner.borrow().broadcast(m)
@@ -156,14 +179,6 @@ impl NodeInner {
                     return;
                 }
             }
-        }
-    }
-
-    fn process(&mut self, msg: Msg, tx: Tx) -> Result<(), io::Error> {
-        match msg {
-            Msg::Ping(m) => self.handle_ping(m, tx),
-            Msg::Pong(m) => self.handle_pong(m, tx),
-            Msg::Payload(m) => self.handle_payload(m, tx),
         }
     }
 
