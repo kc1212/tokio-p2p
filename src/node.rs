@@ -3,6 +3,7 @@ use std::rc::Rc;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::time::Duration;
 use uuid::Uuid;
 use rand::{thread_rng, Rng, ThreadRng};
 
@@ -11,7 +12,7 @@ use futures::sync::mpsc;
 use tokio_core::io::Io;
 use tokio_core::reactor::Handle;
 use tokio_core::net::{TcpStream, TcpListener};
-use tokio_timer::Interval;
+use tokio_timer::Timer;
 
 use codec::{Msg, MsgCodec};
 
@@ -20,6 +21,7 @@ type Tx = mpsc::UnboundedSender<Msg>;
 #[derive(Clone)]
 pub struct Node {
     inner: Rc<RefCell<NodeInner>>,
+    pub timer: Timer,
 }
 
 impl Node {
@@ -31,17 +33,28 @@ impl Node {
             rng: Rc::new(RefCell::new(thread_rng())),
         };
         println!("I'm {:?}", node.id);
-        Node { inner: Rc::new(RefCell::new(node)) }
+        Node { inner: Rc::new(RefCell::new(node)), timer: Timer::default() }
     }
 
-    pub fn run<I: Iterator<Item=SocketAddr>>(&self, handle: Handle, peers: I)
+    pub fn run<I: Iterator<Item=SocketAddr>>(&self, handle: Handle, addrs: I)
                -> Box<Future<Item=(), Error=io::Error>> {
         let inner = self.inner.clone();
+
+        // start the server
         let f = Node::serve(inner.clone(), handle.clone());
-        for peer in peers {
+
+        // attempt to start clients specified by addrs (bootstrap address)
+        for addr in addrs {
             let inner = inner.clone();
-            Node::start_client(inner, handle.clone(), peer);
+            Node::start_client(inner, handle.clone(), addr);
         }
+
+        // gossip currently connected clients
+        handle.spawn(self.gossip_peers(Duration::from_secs(1)).then(|_| {
+            println!("gossip done");
+            Ok(())
+        }));
+
         f
     }
 
@@ -60,11 +73,11 @@ impl Node {
             let (sink, stream) = socket.framed(MsgCodec).split();
             let (tx, rx) = mpsc::unbounded();
 
+            // process incoming stream
             let inner1 = inner.clone();
             let tx1 = tx.clone();
             let handle1 = handle.clone();
             let read = stream.for_each(move |msg| {
-                // inner.borrow_mut().process(msg, tx.clone())
                 Node::process(inner1.clone(), msg, tx1.clone(), handle1.clone())
             });
             handle.spawn(read.then(|_| Ok(())));
@@ -102,7 +115,6 @@ impl Node {
             let handle1 = handle.clone();
             let read = stream.for_each(move |msg| {
                 Node::process(inner1.clone(), msg, tx1.clone(), handle1.clone())
-                // inner2.borrow_mut().process(msg, tx.clone())
             });
             handle.spawn(read.then(|_| Ok(())));
 
@@ -126,6 +138,7 @@ impl Node {
             Msg::AddrVec(m) => {
                 for (id, addr) in m {
                     if !inner.borrow().peers.contains_key(&id) {
+                        println!("ADDING NODE! {:?}", (id, addr));
                         Node::start_client(inner.clone(), handle.clone(), addr);
                     }
                 }
@@ -142,12 +155,15 @@ impl Node {
         self.inner.borrow().send_random(m)
     }
 
-    // TODO use this function to gossip peers
-    pub fn gossip_periodic(&self, interval: Interval, m: Msg)
-                           -> Box<Future<Item=(), Error=io::Error>> {
-        let node = self.inner.clone();
-        let f = interval.for_each(move |_| {
-            Ok(node.borrow().send_random(m.clone()))
+    pub fn gossip_peers(&self, duration: Duration) -> Box<Future<Item=(), Error=io::Error>> {
+        let inner = self.inner.clone();
+        let f = self.timer.interval(duration).for_each(move |_| {
+            let inner1 = inner.clone();
+            let m = inner1.borrow().peers
+                .iter()
+                .map(|(k, v)| (k.clone(), v.1.clone()))
+                .collect();
+            Ok(inner.borrow().send_random(Msg::AddrVec(m)))
         });
 
         Box::new(f.map_err(|e| {
@@ -160,24 +176,26 @@ impl Node {
 struct NodeInner {
     pub id: Uuid,
     pub addr: SocketAddr,
-    pub peers: HashMap<Uuid, Tx>,
+    pub peers: HashMap<Uuid, (Tx, SocketAddr)>,
     rng: Rc<RefCell<ThreadRng>>,
 }
 
 impl NodeInner {
     pub fn broadcast(&self, m: String) {
         println!("broadcasting: {}", m);
-        for tx in self.peers.values() {
+        for v in self.peers.values() {
+            let tx = &v.0;
             // TODO do something better than expect?
             tx.send(Msg::Payload(m.clone())).expect("tx send failed");
         }
     }
 
     pub fn send_random(&self, m: Msg) {
-        println!("sending {:?} to random node", m);
+        // println!("sending {:?} to random node", m);
         let high = self.peers.len();
         loop {
-            for tx in self.peers.values() {
+            for v in self.peers.values() {
+                let tx = &v.0;
                 if self.rng.borrow_mut().gen_range(0, high) == 0 {
                     tx.send(m).expect("tx send failed");
                     return;
@@ -191,12 +209,13 @@ impl NodeInner {
         match self.peers.get(&m.0) {
             Some(_) => {
                 println!("PING ALREADY EXIST! {:?}", m);
+                // TODO drop this connection
                 Ok(())
             }
             None => {
                 println!("ADDING NODE! {:?}", m);
                 let tx2 = tx.clone();
-                self.peers.insert(m.0, tx);
+                self.peers.insert(m.0, (tx, m.1));
                 mpsc::UnboundedSender::send(&tx2, Msg::Pong((self.id, self.addr)))
                     .map_err(|_| io::Error::new(io::ErrorKind::Other, "tx failed"))
             }
@@ -208,10 +227,11 @@ impl NodeInner {
         match self.peers.get(&m.0) {
             Some(_) => {
                 println!("NODE ALREADY EXISTS {:?}", m);
+                // TODO drop this connection
             }
             None => {
                 println!("ADDING NODE! {:?}", m);
-                self.peers.insert(m.0, tx);
+                self.peers.insert(m.0, (tx, m.1));
             }
         }
         Ok(())
@@ -222,5 +242,4 @@ impl NodeInner {
         Ok(())
     }
 }
-
 

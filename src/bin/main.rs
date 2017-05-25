@@ -6,7 +6,6 @@ extern crate tokio_p2p;
 
 use futures::Future;
 use tokio_core::reactor::Core;
-use tokio_timer::Timer;
 
 use std::env;
 use std::time::Duration;
@@ -27,8 +26,8 @@ fn do_work(me: SocketAddr, msg: Option<String>) {
     let handle = core.handle();
     let node = Node::new(me);
     let f = node.run(handle.clone(), peers);
+    let timer = node.timer.clone();
 
-    let timer = Timer::default();
     match msg {
         Some(msg) => {
             let f = timer.sleep(Duration::from_secs(1))
